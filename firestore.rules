@@ -1,0 +1,203 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+        function isAdmin() {
+      return isSignedIn() && (
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isAdmin', false) == true ||
+        request.auth.token.email == 'kko593764@gmail.com'
+      );
+    }
+    // --- Validations ---
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'displayName'])
+        && data.uid == request.auth.uid
+        && (data.get('email', '') == null || data.get('email', '') is string)
+        && data.displayName is string && data.displayName.size() < 100
+        && (data.get('photoURL', '') == null || data.get('photoURL', '') is string)
+        && (data.get('username', '') == null || data.get('username', '') is string)
+        && (data.get('usernameUpdatedAt', null) == null || data.get('usernameUpdatedAt', null) is timestamp)
+        && (data.get('hideName', null) == null || data.get('hideName', null) is bool)
+        && (data.get('customName', '') == null || data.get('customName', '') is string)
+        && (data.get('isHidden', null) == null || data.get('isHidden', null) is bool)
+        && (data.get('friendCode', '') == null || data.get('friendCode', '') is string)
+        && (data.get('status', 'offline') in ['online', 'offline'])
+        && (data.get('bannedUntil', null) == null || data.get('bannedUntil', null) is timestamp)
+        && (data.get('isAdmin', false) == null || data.get('isAdmin', false) is bool);
+    }
+
+    function isValidChat(data) {
+      return data.participantIds is list
+        && data.participantIds.size() >= 1
+        && data.participantIds.size() <= 50
+        && request.auth.uid in data.participantIds
+        && data.updatedAt == request.time
+        && (data.get('isGroup', false) == null || data.get('isGroup', false) is bool)
+        && (data.get('groupName', '') == null || (data.get('groupName', '') is string && data.get('groupName', '').size() <= 100))
+        && (data.get('groupAvatar', '') == null || (data.get('groupAvatar', '') is string && data.get('groupAvatar', '').size() <= 2000000))
+        && (data.get('createdBy', '') == null || data.get('createdBy', '') is string)
+        && (data.get('adminIds', null) == null || (data.get('adminIds', []) is list && data.get('adminIds', []).size() <= 50))
+        && (data.get('lastMessage', '') == null || (data.get('lastMessage', '') is string && data.get('lastMessage', '').size() <= 5000))
+        && (data.get('lastMessageSenderId', '') == null || data.get('lastMessageSenderId', '') is string)
+        && (data.get('lastMessageSenderName', '') == null || data.get('lastMessageSenderName', '') is string);
+    }
+
+    function isValidMessage(data, chatId) {
+      // Relational check: sender must be participant in parent chat
+      return data.keys().hasAll(['senderId', 'timestamp', 'type'])
+        && data.senderId == request.auth.uid
+        && data.timestamp == request.time
+        && data.type in ['text', 'image', 'file', 'voice', 'system']
+        && (data.type != 'text' && data.type != 'system' || (data.get('text', '') is string && data.get('text', '').size() <= 5000))
+        && (data.type == 'text' || data.type == 'system' || data.keys().hasAll(['url']))
+        && (data.get('readBy', null) == null || (data.get('readBy', []) is list && data.get('readBy', []).size() <= 50))
+        && (data.get('deliveredTo', null) == null || (data.get('deliveredTo', []) is list && data.get('deliveredTo', []).size() <= 50))
+        && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds;
+    }
+
+    // --- Rules ---
+
+    match /users/{userId} {
+      allow read: if isSignedIn(); // Allow discovery
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isAdmin() || (
+        isOwner(userId) && isValidUser(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'lastSeen', 'status', 'username', 'email', 'usernameUpdatedAt', 'hideName', 'customName', 'isHidden', 'friendCode'])
+        && (
+          !incoming().diff(existing()).affectedKeys().hasAny(['username']) 
+           || existing().get('username', '') == ''
+        )
+      );
+      allow delete: if isAdmin() || isOwner(userId);
+    }
+
+    match /app_config/{configId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /changelogs/{changelogId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /chats/{chatId} {
+      allow list: if isSignedIn() && (isAdmin() || resource.data.participantIds.hasAny([request.auth.uid]));
+      allow get: if isSignedIn() && (resource == null || isAdmin() || resource.data.participantIds.hasAny([request.auth.uid]));
+      
+      allow create: if isSignedIn() && isValidChat(incoming()) && isValidId(chatId);
+      
+      allow update: if isSignedIn()
+        && (isAdmin() || existing().participantIds.hasAny([request.auth.uid]))
+        && (
+          // Action 1: Update metadata on new message
+          (incoming().participantIds == existing().participantIds && incoming().updatedAt == request.time)
+          ||
+          // Action 2: Update group metadata or participants
+          (
+            existing().get('isGroup', false) == true
+            && incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasAny(['groupName', 'groupAvatar', 'participantIds', 'adminIds', 'updatedAt', 'lastMessage', 'lastMessageSenderId', 'lastMessageSenderName'])
+            && incoming().participantIds is list
+            && incoming().participantIds.size() >= 1
+            && incoming().participantIds.size() <= 50
+            && (incoming().get('adminIds', null) == null || (incoming().get('adminIds', []) is list && incoming().get('adminIds', []).size() <= 50))
+          )
+        );
+
+      allow delete: if isSignedIn() && (isAdmin() || existing().participantIds.hasAny([request.auth.uid]));
+    }
+
+    match /chats/{chatId}/messages/{messageId} {
+      allow list, get: if isSignedIn()
+        && get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds.hasAny([request.auth.uid]);
+      
+      allow create: if isSignedIn() && isValidMessage(incoming(), chatId) && isValidId(messageId);
+      
+      // Allow participants to mark messages as read / delivered
+      allow update: if isSignedIn()
+        && get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds.hasAny([request.auth.uid])
+        && incoming().diff(existing()).affectedKeys().hasOnly(['readBy', 'deliveredTo'])
+        && (incoming().get('readBy', []) is list && incoming().get('readBy', []).size() <= 50)
+        && (incoming().get('deliveredTo', []) is list && incoming().get('deliveredTo', []).size() <= 50);
+
+      allow delete: if isSignedIn() && existing().senderId == request.auth.uid;
+    }
+
+    
+    match /chats/{chatId}/transfers/{transferId} {
+      allow read, write: if isSignedIn();
+    }
+
+    match /chats/{chatId}/typing/{userId} {
+      // Any participant can read typing status
+      allow read: if isSignedIn() 
+        && get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds.hasAny([request.auth.uid]);
+      
+      // User can only update their own typing status if they are a participant
+      allow write: if isOwner(userId)
+        && get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds.hasAny([request.auth.uid])
+        && (request.method == 'create' || request.method == 'update')
+        && incoming().keys().hasAll(['isTyping', 'updatedAt'])
+        && incoming().isTyping is bool
+        && incoming().updatedAt == request.time;
+    }
+
+    match /calls/{callId} {
+      allow list, get: if isSignedIn() && (resource == null || resource.data.participantIds.hasAny([request.auth.uid]));
+      allow create: if isSignedIn()
+        && incoming().keys().hasAll(['participantIds', 'status', 'callerId', 'createdAt', 'updatedAt'])
+        && incoming().participantIds is list
+        && request.auth.uid in incoming().participantIds
+        && incoming().callerId == request.auth.uid
+        && isValidId(callId);
+      
+      allow update: if isSignedIn()
+        && existing().participantIds.hasAny([request.auth.uid])
+        && incoming().participantIds == existing().participantIds
+        && incoming().diff(existing()).affectedKeys().hasAny(['status', 'offer', 'answer', 'updatedAt'])
+        && incoming().updatedAt == request.time;
+      
+      allow delete: if isSignedIn() && existing().participantIds.hasAny([request.auth.uid]);
+      
+      match /callerCandidates/{candidateId} {
+        allow read: if isSignedIn() && get(/databases/$(database)/documents/calls/$(callId)).data.participantIds.hasAny([request.auth.uid]);
+        allow create: if isSignedIn() 
+          && get(/databases/$(database)/documents/calls/$(callId)).data.callerId == request.auth.uid;
+      }
+      
+      match /receiverCandidates/{candidateId} {
+        allow read: if isSignedIn() && get(/databases/$(database)/documents/calls/$(callId)).data.participantIds.hasAny([request.auth.uid]);
+        allow create: if isSignedIn() 
+          && get(/databases/$(database)/documents/calls/$(callId)).data.participantIds.hasAny([request.auth.uid])
+          && get(/databases/$(database)/documents/calls/$(callId)).data.callerId != request.auth.uid;
+      }
+    }
+  }
+}
